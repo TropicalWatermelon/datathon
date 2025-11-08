@@ -1,12 +1,12 @@
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="Simple MCP Demo", page_icon="🤖", layout="centered")
+st.set_page_config(page_title="Simple MCP Demo", page_icon="^_^", layout="centered")
 
-st.title("🤖 Model Context Protocol Demo")
+st.title("Model Context Protocol Demo")
 st.write("Ask me about **weather** or **news**, and I’ll fetch live context before answering!")
 
-query = st.text_input("Your question", placeholder="e.g., What’s the weather in Austin?")
+query = st.text_input("YourW question", placeholder="e.g., What’s the weather in Austin?")
 submit = st.button("Ask")
 
 if submit and query.strip():
@@ -19,10 +19,10 @@ if submit and query.strip():
             )
             if response.status_code == 200:
                 data = response.json()
-                st.subheader("🧠 Context")
+                st.subheader("Context")
                 st.info(data.get("context", "No context found."))
 
-                st.subheader("💬 AI Response")
+                st.subheader("AI Response")
                 st.success(data.get("response", "No response generated."))
             else:
                 st.error(f"Server returned {response.status_code}: {response.text}")
