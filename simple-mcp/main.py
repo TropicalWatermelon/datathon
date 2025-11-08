@@ -1,187 +1,317 @@
 from fastapi import FastAPI, Request
-from utils.ai_client import ask_ai
 from dotenv import load_dotenv
-import os
-import requests
+from typing import Optional, Dict, Any, List
+import os, requests, re
+
+# If you still want LLM responses:
+from utils.ai_client import ask_ai
 
 load_dotenv()
-
 app = FastAPI()
 
-# Environment variables
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-FINANCIAL_API_KEY = os.getenv("FINANCIAL_API_KEY")
+class FDCError(Exception):
+    pass
 
+
+# --- ENV ---
+USDA_API_KEY = os.getenv("USDA_API_KEY")  # FDC key (Data.gov)
+FSIS_BASE = os.getenv("FSIS_BASE", "https://www.fsis.usda.gov")
+
+# --- ROOT ---
 @app.get("/")
 def home():
-    return {"message": "MCP server is live! Use POST /query to test."}
+    return {"message": "Food Safety server is live. POST /query, or try /fdc/search?q=apple and /fsis/recalls?status=active"}
 
+# --- Main unified endpoint (keeps your shape) ---
 @app.post("/query")
 async def handle_query(request: Request):
     body = await request.json()
-    query = body.get("query", "")
+    query: str = body.get("query", "")
 
-    context = ""
+    qlow = query.lower()
+    context: str
 
-    # --- CONTEXT FETCHING LOGIC ---
-    if "weather" in query.lower():
-        context = get_weather(query)
-    elif ("finance" or "financial") in query.lower() or "stock" in query.lower():
-        context = get_financial_context(query)
-    elif "news" in query.lower():
-        context = get_news_context(query)
+    if any(k in qlow for k in ["recall", "safety", "fsis", "alert"]):
+        context = fsis_recall_context(query)
+    elif any(k in qlow for k in ["nutrition", "fdc", "nutrient", "calorie", "ingredient"]):
+        context = fdc_context(query)
     else:
-        context = "No external context was found for this query."
+        context = "No USDA context found. Try asking about recalls (e.g., 'any chicken recalls?') or FDC nutrition (e.g., 'nutrition for apple')."
 
-    # Combine context + query → send to AI model
-    ai_response = ask_ai(query, context)
+    ai_response = ask_ai(query, context)  # optional; remove if not needed
+    return {"query": query, "context": context, "response": ai_response}
 
-    return {
-        "query": query,
-        "context": context,
-        "response": ai_response
-    }
+# ------------------------
+# USDA FoodData Central (FDC)
+# Docs: https://fdc.nal.usda.gov/api-guide
+# ------------------------
 
+FDC_BASE = "https://api.nal.usda.gov/fdc/v1"
 
-import os
-import requests
-
-def get_weather(city: str):
-    api_key = os.getenv("OPENWEATHER_API_KEY")
-    if not api_key:
-        return "Weather API key not found. Please check your .env file."
-
-    # Clean city input
-    city = city.strip().replace("?", "").replace(".", "")
-
-    # Build the API URL
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
-
-    try:
-        res = requests.get(url, timeout=10)
-        print("Weather API status:", res.status_code)
-        if res.status_code == 200:
-            data = res.json()
-            desc = data["weather"][0]["description"].capitalize()
-            temp = data["main"]["temp"]
-            feels_like = data["main"]["feels_like"]
-            humidity = data["main"]["humidity"]
-            return (
-                f"Weather in {city}: {desc}. "
-                f"Temperature: {temp}°C (feels like {feels_like}°C). "
-                f"Humidity: {humidity}%."
-            )
-        else:
-            print("Weather API response:", res.text)
-            return f"Couldn't fetch weather data for {city}. (status: {res.status_code})"
-    except Exception as e:
-        print("Weather fetch error:", e)
-        return f"Error fetching weather for {city}: {str(e)}"
-
-
-def get_news_context(query: str) -> str:
-    """Fetch top tech headlines using NewsAPI"""
-    category = "technology"
-    if "sports" in query.lower():
-        category = "sports"
-    elif "business" in query.lower():
-        category = "business"
-
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"country": "us", "category": category, "apiKey": NEWS_API_KEY}
-
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-
-        if data.get("status") != "ok":
-            return "Couldn't fetch news data."
-
-        articles = data.get("articles", [])[:3]  # take top 3 headlines
-        headlines = [a["title"] for a in articles if a.get("title")]
-        summary = " | ".join(headlines) if headlines else "No recent headlines found."
-
-        return f"Top {category} news: {summary}"
-    except Exception as e:
-        return f"Error fetching news: {e}"
-
-import os
-import requests
-import re # This import is crucial for the helper function
-from typing import Optional
-
-# --- HELPER FUNCTION: Ticker Extraction (MUST be defined first) ---
-def extract_ticker(query: str) -> Optional[str]:
+@app.get("/fdc/search")
+def fdc_search(q: str, dataType: Optional[str] = None, pageSize: int = 5):
     """
-    Tries to extract a single stock ticker from the query, prioritizing
-    the common '$TICKER' format or plain capitalized 1-5 letter symbols.
+    Example: /fdc/search?q=apple&dataType=Survey%20(FNDDS)
     """
-    # 1. Look for the $TICKER pattern (e.g., $GOOG, $MSFT)
-    # The regex (?<=\$)([A-Z]{1,5}) looks for 1-5 uppercase letters
-    # immediately following a dollar sign, without including the dollar sign.
-    dollar_match = re.search(r'(?<=\$)([A-Z]{1,5})', query.upper())
-    if dollar_match:
-        return dollar_match.group(1)
+    if not USDA_API_KEY:
+        return {"error": "USDA_API_KEY not set"}
+    params = {"api_key": USDA_API_KEY, "query": q, "pageSize": pageSize}
+    if dataType:
+        params["dataType"] = dataType
+    r = requests.get(f"{FDC_BASE}/foods/search", params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-    # 2. Fallback to the original logic (All Caps 1-5 letter word)
-    # This is useful for queries like "price of AAPL"
-    all_caps_match = re.search(r'\b[A-Z]{1,5}\b', query.upper())
-    if all_caps_match:
-        ticker = all_caps_match.group(0)
-        # Exclude common stop words (can be expanded)
-        if ticker not in ["THE", "IS", "WHAT", "FOR", "NEWS", "STOCK", "FINANCE", "ASK"]:
-            return ticker
-            
-    return None
+@app.get("/fdc/food/{fdc_id}")
+def fdc_food(fdc_id: int):
+    """
+    Example: /fdc/food/1102647
+    """
+    if not USDA_API_KEY:
+        return {"error": "USDA_API_KEY not set"}
+    r = requests.get(f"{FDC_BASE}/food/{fdc_id}", params={"api_key": USDA_API_KEY}, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+def fsis_recall_context(query: str) -> str:
+    term = extract_food_term(query) or query
+    try:
+        data = _fsis_recalls_json(query=term, limit=3)
+    except Exception as e:
+        return f"Error fetching FSIS recalls: {e}"
+
+    # Guaranteed dict from helper
+    hits = data.get("results", [])
+    if not hits:
+        return f"No recent FSIS recalls found for '{term}'."
+
+    parts = []
+    for h in hits:
+        parts.append(f"{h.get('title')} (Class={h.get('risk_level')}, Status={h.get('status')})")
+    return " | ".join(parts)
 
 
-def get_financial_context(query: str) -> str:
-    """Fetch the latest stock quote for a ticker found in the query using Alpha Vantage."""
-    api_key = os.getenv("FINANCIAL_API_KEY")
-    if not api_key:
-        return "Financial API key not found. Please check your .env file."
+# ----- FDC: smarter search & ranking -----
 
-    ticker = extract_ticker(query)
-    if not ticker:
-        return "Couldn't identify a stock ticker in the query."
+# Prefer non-branded datasets first to avoid PowerBar-type hits
+_FDC_DATATYPES_PRIORITIZED = [
+    "Survey (FNDDS)",   # common foods as consumed
+    "Foundation",       # curated single-ingredient items
+    "SR Legacy",        # legacy SR data
+    "Branded",          # LAST: packaged/brand items
+]
 
-    # Alpha Vantage Global Quote Endpoint
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "GLOBAL_QUOTE",
-        "symbol": ticker,
-        "apikey": api_key
+def _fdc_search_multi(term: str, per_type: int = 5) -> List[Dict[str, Any]]:
+    """Query multiple FDC dataTypes (prioritized) and merge results."""
+    all_hits: List[Dict[str, Any]] = []
+    for dt in _FDC_DATATYPES_PRIORITIZED:
+        try:
+            data = _fdc_search_json(term, data_type=dt, page_size=per_type)
+        except Exception:
+            continue
+        foods = data.get("foods") or []
+        if isinstance(foods, list):
+            all_hits.extend([f for f in foods if isinstance(f, dict)])
+    return all_hits
+
+def _score_fdc_hit(term: str, f: Dict[str, Any]) -> float:
+    """Heuristic score: favor exact/clean matches, penalize obviously irrelevant items."""
+    t = term.strip().lower()
+    desc = str(f.get("description") or "").lower()
+    brand = f.get("brandOwner")
+    ing = str(f.get("ingredients") or "").lower()
+
+    score = 0.0
+    # strong positive signals
+    if desc == t or desc.startswith(t):
+        score += 10
+    if t in desc:
+        score += 6
+    if t and t in ing:
+        score += 4
+
+    # prefer non-branded for generic queries like "chicken"
+    if brand:
+        score -= 2
+    else:
+        score += 1
+
+    # mild boost if category hints match (when present)
+    cat = str(f.get("foodCategory") or "").lower()
+    if t in cat:
+        score += 2
+
+    # generic penalties for common false positives when asking for simple foods
+    bad_tokens = ["bar", "powder", "supplement", "shake", "cereal", "snack", "energy"]
+    if any(bt in desc for bt in bad_tokens):
+        score -= 3
+
+    return score
+
+def _pick_best_fdc_hit(term: str, foods: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not foods:
+        return None
+    # require the term to appear in description or ingredients when possible
+    filtered = [
+        f for f in foods
+        if term.lower() in str(f.get("description", "")).lower()
+        or term.lower() in str(f.get("ingredients", "")).lower()
+        or not any(isinstance(f.get(k), str) for k in ("description", "ingredients"))  # keep if fields missing
+    ]
+    candidates = filtered if filtered else foods
+    return max(candidates, key=lambda f: _score_fdc_hit(term, f))
+
+def fdc_context(query: str) -> str:
+    term = extract_food_term(query) or query
+    try:
+        hits = _fdc_search_multi(term, per_type=8)
+    except Exception as e:
+        return f"Error fetching FDC context: {e}"
+
+    best = _pick_best_fdc_hit(term, hits)
+    if not best:
+        return f"No FDC results for '{term}'."
+
+    fdc_id = best.get("fdcId")
+    desc = best.get("description")
+    brand = best.get("brandOwner")
+    nutrients = best.get("foodNutrients") or []
+
+    wanted = {
+        "Energy",
+        "Protein",
+        "Total lipid (fat)",
+        "Carbohydrate, by difference",
+        "Sodium, Na",
     }
+    picked: List[str] = []
+    if isinstance(nutrients, list):
+        for n in nutrients:
+            if isinstance(n, dict) and n.get("nutrientName") in wanted:
+                unit = n.get("unitName", "")
+                val = n.get("value")
+                picked.append(f"{n.get('nutrientName')}: {val}{unit}")
+
+    core = ", ".join(picked[:4]) if picked else "Key nutrients not available."
+    brand_part = f" ({brand})" if brand else ""
+    return f"FDC Match for '{term}': {desc}{brand_part}, fdcId={fdc_id}. {core}"
+
+
+
+def extract_food_term(q: str) -> Optional[str]:
+    # Minimal heuristic: pull the word after 'for' or 'of' if present; else return None
+    m = re.search(r"(?:for|of)\s+([A-Za-z0-9 \-\_]+)", q, flags=re.I)
+    return m.group(1).strip() if m else None
+
+
+
+# ------------------------
+# USDA FSIS Recall API
+# Docs/landing: https://www.fsis.usda.gov/science-data/developer-resources/recall-api
+# ------------------------
+
+@app.get("/fsis/recalls")
+def fsis_recalls(status: Optional[str] = None, query: Optional[str] = None, limit: int = 5):
+    """
+    Example: /fsis/recalls?status=active
+             /fsis/recalls?query=chicken
+    The FSIS API supports attribute-based querying and returns JSON.
+    """
+    # The documented endpoint is exposed via the FSIS site; use search or filters.
+    # We'll use a simple keyword search parameter 'query' if available.
+    # If FSIS updates endpoints, adjust here.
+    try:
+        # Public search endpoint (content search) returns recall pages; for production,
+        # use the official Recall API JSON endpoint when provided by FSIS docs.
+        url = f"{FSIS_BASE}/api/recalls"  # canonical placeholder per FSIS Recall API docs
+        params: Dict[str, Any] = {}
+        if status:
+            params["status"] = status  # e.g., 'active'
+        if query:
+            params["q"] = query
+
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        # Normalize the top N to a compact list
+        items = data if isinstance(data, list) else data.get("results", [])
+        simplified: List[Dict[str, Any]] = []
+        for it in items[:limit]:
+            simplified.append({
+                "title": it.get("title") or it.get("recall_title") or it.get("headline"),
+                "recall_number": it.get("recall_number") or it.get("id"),
+                "status": it.get("status"),
+                "risk_level": it.get("risk_level") or it.get("class"),
+                "reason": it.get("reason") or it.get("reason_for_recall"),
+                "date": it.get("date") or it.get("publication_date") or it.get("start_date"),
+                "link": it.get("url") or it.get("link")
+            })
+        return {"results": simplified}
+    except Exception as e:
+        return {"error": f"FSIS recall fetch failed: {e}"}
+    
+
+# --- FSIS helper & guarded versions ---
+
+class FSISError(Exception):
+    pass
+
+FSIS_DATA_URL = "https://data.fsis.usda.gov/resource/recalls.json"
+
+def _fsis_recalls_json(
+    query: Optional[str] = None,
+    status: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """
+    Always returns a dict: {"results": [ ... simplified items ... ]}
+    Raises FSISError on unexpected shapes / HTTP errors.
+    """
+    params: Dict[str, Any] = {"$limit": limit}
+    if status:
+        params["status"] = status  # e.g., "Active"
+    if query:
+        params["$q"] = query       # full-text search
 
     try:
-        res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
-        data = res.json()
+        r = requests.get(FSIS_DATA_URL, params=params, timeout=15)
+        r.raise_for_status()
+        raw = r.json()
+    except requests.RequestException as e:
+        raise FSISError(f"FSIS HTTP error: {e}") from e
+    except ValueError as e:
+        raise FSISError("FSIS returned non-JSON") from e
 
-        quote = data.get("Global Quote")
-        if not quote or len(quote) < 5:
-             # This means the ticker was likely not found or the market is closed and data is unavailable
-            return f"No financial data available for ticker '{ticker}'. It may not exist."
+    if not isinstance(raw, list):
+        raise FSISError(f"Unexpected FSIS response type: {type(raw).__name__}")
 
-        # Extract and format key financial metrics
-        current_price = quote.get("05. price", "N/A")
-        change_percent = quote.get("10. change percent", "N/A")
-        volume = int(quote.get("06. volume", 0))
+    simplified: List[Dict[str, Any]] = []
+    for it in raw[:limit]:
+        if not isinstance(it, dict):
+            continue
+        simplified.append({
+            "title": it.get("title") or it.get("recall_title") or it.get("headline"),
+            "recall_number": it.get("recall_number") or it.get("id"),
+            "status": it.get("status"),
+            "risk_level": it.get("classification") or it.get("class"),
+            "reason": it.get("reason") or it.get("reason_for_recall"),
+            "date": it.get("recall_initiation_date") or it.get("date") or it.get("publication_date") or it.get("start_date"),
+            "link": it.get("url") or it.get("link"),
+        })
 
-        # Format volume with commas for readability
-        formatted_volume = f"{volume:,}"
+    return {"results": simplified}
+    
+def _fdc_search_json(q: str, data_type: Optional[str] = None, page_size: int = 5) -> Dict[str, Any]:
+    if not USDA_API_KEY:
+        raise FDCError("USDA_API_KEY not set")
+    params: Dict[str, Any] = {"api_key": USDA_API_KEY, "query": q, "pageSize": page_size}
+    if data_type:
+        params["dataType"] = data_type
+    r = requests.get(f"{FDC_BASE}/foods/search", params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict):
+        raise FDCError(f"Unexpected FDC response type: {type(data).__name__}")
+    return data
 
-        return (
-            f"Current financial data for **{ticker}**: "
-            f"Price: ${current_price}. "
-            f"Change: {change_percent} since last close. "
-            f"Volume today: {formatted_volume}."
-        )
-
-    except requests.exceptions.RequestException as e:
-        print("Financial fetch error:", e)
-        return f"Error connecting to financial data API: {str(e)}"
-
-# ... (Remaining FastAPI setup, home, and handle_query functions)
-# Note: You still need to place your API key for Alpha Vantage into your .env file
