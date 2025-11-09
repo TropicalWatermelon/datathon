@@ -4,7 +4,7 @@ import requests
 st.set_page_config(page_title="Simple MCP Demo", page_icon="^_^", layout="centered")
 
 st.title("Model Context Protocol Demo")
-st.write("Ask me about **weather** or **news**, and I’ll fetch live context before answering!")
+st.write("Ask me about food, and I’ll fetch live context before answering!")
 
 query = st.text_input("YourW question", placeholder="e.g., What’s the weather in Austin?")
 submit = st.button("Ask")

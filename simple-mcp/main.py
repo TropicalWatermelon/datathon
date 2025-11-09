@@ -1,111 +1,133 @@
 from fastapi import FastAPI, Request
 from dotenv import load_dotenv
 from typing import Optional, Dict, Any, List
-from helpers_usda import _fdc_search_json, _fdc_search_multi, _score_fdc_hit, _pick_best_fdc_hit, FDCError, _fsis_recalls_json
-import os, requests, re
+import re
 
-# If you still want LLM responses:
+# LLM glue (optional)
 from utils.ai_client import ask_ai
 
+# USDA helpers
+from helpers_usda import (
+    _fdc_search_json,        # raw FDC search (JSON)
+    _fdc_search_multi,       # multi-datatype search
+    _pick_best_fdc_hit,      # ranking
+    _fsis_recalls_json,      # FSIS open-data recalls (JSON)
+)
+
+# Ensure .env is loaded for anything that reads env on import (defensive)
 load_dotenv()
+
 app = FastAPI()
 
-class FDCError(Exception):
-    pass
 
-
-# --- ENV ---
-USDA_API_KEY = os.getenv("USDA_API_KEY")  # FDC key (Data.gov)
-FSIS_BASE = os.getenv("FSIS_BASE", "https://www.fsis.usda.gov")
-
-# --- ROOT ---
+# ------------------------
+# Root
+# ------------------------
 @app.get("/")
 def home():
-    return {"message": "Food Safety server is live. POST /query, or try /fdc/search?q=apple and /fsis/recalls?status=active"}
+    return {
+        "message": "Food Safety server is live.",
+        "try": [
+            "/fdc/search?q=apple",
+            "/fdc/food/1102647",
+            "/fsis/recalls?status=Active",
+        ],
+    }
 
-# --- Main unified endpoint (keeps your shape) ---
+
+# ------------------------
+# Unified LLM-style endpoint
+# ------------------------
 @app.post("/query")
 async def handle_query(request: Request):
     body = await request.json()
     query: str = body.get("query", "")
 
     qlow = query.lower()
-    context: str
-
     if any(k in qlow for k in ["recall", "safety", "fsis", "alert"]):
         context = fsis_recall_context(query)
     elif any(k in qlow for k in ["nutrition", "fdc", "nutrient", "calorie", "ingredient"]):
         context = fdc_context(query)
     else:
-        context = "No USDA context found. Try asking about recalls (e.g., 'any chicken recalls?') or FDC nutrition (e.g., 'nutrition for apple')."
+        context = (
+            "No USDA context found. Try recalls (e.g., 'any chicken recalls?') "
+            "or nutrition (e.g., 'nutrition for apple')."
+        )
 
-    ai_response = ask_ai(query, context)  # optional; remove if not needed
+    # Optional: feed context to your LLM
+    ai_response = ask_ai(query, context)
     return {"query": query, "context": context, "response": ai_response}
 
-# ------------------------
-# USDA FoodData Central (FDC)
-# Docs: https://fdc.nal.usda.gov/api-guide
-# ------------------------
 
-FDC_BASE = "https://api.nal.usda.gov/fdc/v1"
-
+# ------------------------
+# FDC pass-through routes (useful for debugging)
+# ------------------------
 @app.get("/fdc/search")
-def fdc_search(q: str, dataType: Optional[str] = None, pageSize: int = 5):
-    """
-    Example: /fdc/search?q=apple&dataType=Survey%20(FNDDS)
-    """
-    if not USDA_API_KEY:
-        return {"error": "USDA_API_KEY not set"}
-    params = {"api_key": USDA_API_KEY, "query": q, "pageSize": pageSize}
-    if dataType:
-        params["dataType"] = dataType
-    r = requests.get(f"{FDC_BASE}/foods/search", params=params, timeout=15)
-    r.raise_for_status()
-    return r.json()
+def fdc_search(q: str, dataType: Optional[str] = None, pageSize: int = 5) -> Dict[str, Any]:
+    return _fdc_search_json(q, data_type=dataType, page_size=pageSize)
 
 @app.get("/fdc/food/{fdc_id}")
-def fdc_food(fdc_id: int):
-    """
-    Example: /fdc/food/1102647
-    """
-    if not USDA_API_KEY:
-        return {"error": "USDA_API_KEY not set"}
-    r = requests.get(f"{FDC_BASE}/food/{fdc_id}", params={"api_key": USDA_API_KEY}, timeout=15)
+def fdc_food(fdc_id: int) -> Dict[str, Any]:
+    # simple passthrough convenience
+    from helpers_usda import FDC_BASE, _require_api_key
+    api_key = _require_api_key()
+    import requests
+    r = requests.get(
+        f"{FDC_BASE}/food/{fdc_id}",
+        params={"api_key": api_key},
+        timeout=15
+    )
     r.raise_for_status()
     return r.json()
 
-def fsis_recall_context(query: str) -> str:
-    term = extract_food_term(query) or query
+
+# ------------------------
+# Recall route (FSIS open data)
+# ------------------------
+@app.get("/fsis/recalls")
+def fsis_recalls(status: Optional[str] = None, query: Optional[str] = None, limit: int = 5) -> Dict[str, Any]:
     try:
-        data = _fsis_recalls_json(query=term, limit=3)
+        return _fsis_recalls_json(query=query, status=status, limit=limit)
     except Exception as e:
-        return f"Error fetching FSIS recalls: {e}"
-
-    # Guaranteed dict from helper
-    hits = data.get("results", [])
-    if not hits:
-        return f"No recent FSIS recalls found for '{term}'."
-
-    parts = []
-    for h in hits:
-        parts.append(f"{h.get('title')} (Class={h.get('risk_level')}, Status={h.get('status')})")
-    return " | ".join(parts)
+        return {"error": f"FSIS recall fetch failed: {e}"}
 
 
-# ----- FDC: smarter search & ranking -----
+# ------------------------
+# Context builders (string outputs)
+# ------------------------
+STOP_WORDS = {
+    "nutrition", "nutritional", "calorie", "calories", "macro", "macros",
+    "facts", "info", "information", "data", "content", "about", "for", "of"
+}
 
-# Prefer non-branded datasets first to avoid PowerBar-type hits
-_FDC_DATATYPES_PRIORITIZED = [
-    "Survey (FNDDS)",   # common foods as consumed
-    "Foundation",       # curated single-ingredient items
-    "SR Legacy",        # legacy SR data
-    "Branded",          # LAST: packaged/brand items
-]
+def extract_food_term(q: str) -> Optional[str]:
+    """
+    Pulls the word(s) after 'for' or 'of' if present.
+    """
+    m = re.search(r"(?:for|of)\s+([A-Za-z0-9 \-_.]+)", q, flags=re.I)
+    return m.group(1).strip() if m else None
+
+def _normalize_food_term(raw: str) -> str:
+    """
+    Strip punctuation and remove stop-words like 'nutrition' so
+    'chicken nutrition' -> 'chicken'.
+    """
+    cleaned = re.sub(r"[^\w\s\-]", " ", raw.lower()).strip()
+    tokens = [t for t in cleaned.split() if t not in STOP_WORDS]
+    return " ".join(tokens) if tokens else raw.split()[0]
 
 def fdc_context(query: str) -> str:
-    term = extract_food_term(query) or query
+    raw = extract_food_term(query) or query
+    term = _normalize_food_term(raw)
+
     try:
         hits = _fdc_search_multi(term, per_type=8)
+        if not hits:
+            # Fallback: try last token (e.g., from "grilled chicken breast" -> "breast" / "chicken")
+            last = term.split()[-1]
+            if last != term:
+                hits = _fdc_search_multi(last, per_type=8)
+                term = last
     except Exception as e:
         return f"Error fetching FDC context: {e}"
 
@@ -118,13 +140,7 @@ def fdc_context(query: str) -> str:
     brand = best.get("brandOwner")
     nutrients = best.get("foodNutrients") or []
 
-    wanted = {
-        "Energy",
-        "Protein",
-        "Total lipid (fat)",
-        "Carbohydrate, by difference",
-        "Sodium, Na",
-    }
+    wanted = {"Energy", "Protein", "Total lipid (fat)", "Carbohydrate, by difference", "Sodium, Na"}
     picked: List[str] = []
     if isinstance(nutrients, list):
         for n in nutrients:
@@ -137,66 +153,16 @@ def fdc_context(query: str) -> str:
     brand_part = f" ({brand})" if brand else ""
     return f"FDC Match for '{term}': {desc}{brand_part}, fdcId={fdc_id}. {core}"
 
-
-
-def extract_food_term(q: str) -> Optional[str]:
-    # Minimal heuristic: pull the word after 'for' or 'of' if present; else return None
-    m = re.search(r"(?:for|of)\s+([A-Za-z0-9 \-\_]+)", q, flags=re.I)
-    return m.group(1).strip() if m else None
-
-
-
-# ------------------------
-# USDA FSIS Recall API
-# Docs/landing: https://www.fsis.usda.gov/science-data/developer-resources/recall-api
-# ------------------------
-
-@app.get("/fsis/recalls")
-def fsis_recalls(status: Optional[str] = None, query: Optional[str] = None, limit: int = 5):
-    """
-    Example: /fsis/recalls?status=active
-             /fsis/recalls?query=chicken
-    The FSIS API supports attribute-based querying and returns JSON.
-    """
-    # The documented endpoint is exposed via the FSIS site; use search or filters.
-    # We'll use a simple keyword search parameter 'query' if available.
-    # If FSIS updates endpoints, adjust here.
+def fsis_recall_context(query: str) -> str:
+    term = extract_food_term(query) or query
     try:
-        # Public search endpoint (content search) returns recall pages; for production,
-        # use the official Recall API JSON endpoint when provided by FSIS docs.
-        url = f"{FSIS_BASE}/api/recalls"  # canonical placeholder per FSIS Recall API docs
-        params: Dict[str, Any] = {}
-        if status:
-            params["status"] = status  # e.g., 'active'
-        if query:
-            params["q"] = query
-
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-
-        # Normalize the top N to a compact list
-        items = data if isinstance(data, list) else data.get("results", [])
-        simplified: List[Dict[str, Any]] = []
-        for it in items[:limit]:
-            simplified.append({
-                "title": it.get("title") or it.get("recall_title") or it.get("headline"),
-                "recall_number": it.get("recall_number") or it.get("id"),
-                "status": it.get("status"),
-                "risk_level": it.get("risk_level") or it.get("class"),
-                "reason": it.get("reason") or it.get("reason_for_recall"),
-                "date": it.get("date") or it.get("publication_date") or it.get("start_date"),
-                "link": it.get("url") or it.get("link")
-            })
-        return {"results": simplified}
+        data = _fsis_recalls_json(query=term, limit=3)
     except Exception as e:
-        return {"error": f"FSIS recall fetch failed: {e}"}
-    
+        return f"Error fetching FSIS recalls: {e}"
 
-# --- FSIS helper & guarded versions ---
+    hits = data.get("results", [])
+    if not hits:
+        return f"No recent FSIS recalls found for '{term}'."
 
-class FSISError(Exception):
-    pass
-
-
-
+    parts = [f"{h.get('title')} (Class={h.get('risk_level')}, Status={h.get('status')})" for h in hits]
+    return " | ".join(parts)
