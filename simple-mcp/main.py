@@ -1,40 +1,70 @@
+# main.py
+
 from fastapi import FastAPI, Request
-from utils.ai_client import ask_ai
+from utils.ai_client import ask_ai # Assuming this is in a utils folder
 from dotenv import load_dotenv
 import os
 import requests
+import re
+from typing import Optional
+from functools import lru_cache 
+
+# --- NEW: spaCy Imports ---
+import spacy
+# Load the small model once when the server starts
+nlp = spacy.load("en_core_web_sm")
+# --- End of NEW ---
 
 load_dotenv()
 
 app = FastAPI()
 
-# Environment variables
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
-NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-FINANCIAL_API_KEY = os.getenv("FINANCIAL_API_KEY")
+# --- Environment variables ---
+OPENFDA_API_KEY = os.getenv("OPENFDA_API_KEY")
+USDA_API_KEY = os.getenv("USDA_API_KEY") 
+
+
+# --- Endpoints ---
 
 @app.get("/")
 def home():
-    return {"message": "MCP server is live! Use POST /query to test."}
+    return {"message": "Food Safety & Nutrition MCP server is live! Use POST /query to test."}
+
 
 @app.post("/query")
 async def handle_query(request: Request):
     body = await request.json()
     query = body.get("query", "")
+    query_lower = query.lower() 
 
     context = ""
 
-    # --- CONTEXT FETCHING LOGIC ---
-    if "weather" in query.lower():
-        context = get_weather(query)
-    elif ("finance" or "financial") in query.lower() or "stock" in query.lower():
-        context = get_financial_context(query)
-    elif "news" in query.lower():
-        context = get_news_context(query)
-    else:
-        context = "No external context was found for this query."
+    if "recall" in query_lower:
+        context = get_food_recalls(query)
+        
+    elif "nutrition" in query_lower or "ingredients" in query_lower or "info for" in query_lower or "allergens" in query_lower:
+        
+        # This will now call the new, smarter spaCy function
+        search_term = extract_product_search_term(query)
+        
+        if not search_term:
+            context = "Please specify a product name to look up."
+        else:
+            print(f"Searching for product info for: {search_term}")
+            
+            print("Trying USDA API first...")
+            context = get_usda_nutrition(search_term) 
+            
+            if context is None:
+                print("USDA API failed or found no match. Trying Open Food Facts...")
+                context = get_openfoodfacts_info(search_term)
+            
+            if context is None:
+                context = f"Couldn't fetch product data for '{search_term}' from any source."
 
-    # Combine context + query → send to AI model
+    else:
+        context = "No food recall or product info context was found for this query."
+
     ai_response = ask_ai(query, context)
 
     return {
@@ -43,145 +73,244 @@ async def handle_query(request: Request):
         "response": ai_response
     }
 
+# --- NEW: Smart Search Term Extractor (using spaCy) ---
 
-import os
-import requests
-
-def get_weather(city: str):
-    api_key = os.getenv("OPENWEATHER_API_KEY")
-    if not api_key:
-        return "Weather API key not found. Please check your .env file."
-
-    # Clean city input
-    city = city.strip().replace("?", "").replace(".", "")
-
-    # Build the API URL
-    url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={api_key}&units=metric"
-
-    try:
-        res = requests.get(url, timeout=10)
-        print("Weather API status:", res.status_code)
-        if res.status_code == 200:
-            data = res.json()
-            desc = data["weather"][0]["description"].capitalize()
-            temp = data["main"]["temp"]
-            feels_like = data["main"]["feels_like"]
-            humidity = data["main"]["humidity"]
-            return (
-                f"Weather in {city}: {desc}. "
-                f"Temperature: {temp}°C (feels like {feels_like}°C). "
-                f"Humidity: {humidity}%."
-            )
-        else:
-            print("Weather API response:", res.text)
-            return f"Couldn't fetch weather data for {city}. (status: {res.status_code})"
-    except Exception as e:
-        print("Weather fetch error:", e)
-        return f"Error fetching weather for {city}: {str(e)}"
-
-
-def get_news_context(query: str) -> str:
-    """Fetch top tech headlines using NewsAPI"""
-    category = "technology"
-    if "sports" in query.lower():
-        category = "sports"
-    elif "business" in query.lower():
-        category = "business"
-
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"country": "us", "category": category, "apiKey": NEWS_API_KEY}
-
-    try:
-        response = requests.get(url, params=params)
-        data = response.json()
-
-        if data.get("status") != "ok":
-            return "Couldn't fetch news data."
-
-        articles = data.get("articles", [])[:3]  # take top 3 headlines
-        headlines = [a["title"] for a in articles if a.get("title")]
-        summary = " | ".join(headlines) if headlines else "No recent headlines found."
-
-        return f"Top {category} news: {summary}"
-    except Exception as e:
-        return f"Error fetching news: {e}"
-
-import os
-import requests
-import re # This import is crucial for the helper function
-from typing import Optional
-
-# --- HELPER FUNCTION: Ticker Extraction (MUST be defined first) ---
-def extract_ticker(query: str) -> Optional[str]:
+def extract_product_search_term(query: str) -> Optional[str]:
     """
-    Tries to extract a single stock ticker from the query, prioritizing
-    the common '$TICKER' format or plain capitalized 1-5 letter symbols.
+    Uses NLP (spaCy) to find the most likely product in the query.
     """
-    # 1. Look for the $TICKER pattern (e.g., $GOOG, $MSFT)
-    # The regex (?<=\$)([A-Z]{1,5}) looks for 1-5 uppercase letters
-    # immediately following a dollar sign, without including the dollar sign.
-    dollar_match = re.search(r'(?<=\$)([A-Z]{1,5})', query.upper())
-    if dollar_match:
-        return dollar_match.group(1)
+    # Define keywords we want to ignore
+    stopwords = {"nutrition", "ingredients", "info", "allergens", "for", "on", 
+                 "of", "about", "in", "what", "is", "are", "the", "a", "an"}
+    
+    doc = nlp(query.lower())
+    
+    # 1. Check for "noun chunks" (e.g., "peanut butter", "coca cola")
+    # This is the most reliable method
+    for chunk in doc.noun_chunks:
+        # Clean the chunk by removing stopwords
+        clean_chunk = " ".join(token.text for token in chunk if token.text not in stopwords)
+        
+        # If the chunk is more than one word, it's probably a product
+        if len(clean_chunk.split()) > 1:
+            print(f"NLP (Chunk) found: {clean_chunk}")
+            return clean_chunk.strip()
 
-    # 2. Fallback to the original logic (All Caps 1-5 letter word)
-    # This is useful for queries like "price of AAPL"
-    all_caps_match = re.search(r'\b[A-Z]{1,5}\b', query.upper())
-    if all_caps_match:
-        ticker = all_caps_match.group(0)
-        # Exclude common stop words (can be expanded)
-        if ticker not in ["THE", "IS", "WHAT", "FOR", "NEWS", "STOCK", "FINANCE", "ASK"]:
-            return ticker
-            
-    return None
+    # 2. If no multi-word chunks, check for single proper nouns (e.g., "Nutella")
+    # or just nouns if they aren't stopwords
+    for token in reversed(doc): # Go backwards to find the last noun
+        if token.pos_ in ["PROPN", "NOUN"] and token.text not in stopwords:
+            print(f"NLP (Token) found: {token.text}")
+            return token.text
 
+    # 3. Fallback: If NLP fails, just clean the whole string
+    # This is similar to our old "dumb" logic
+    fallback_term = re.sub(r"(nutrition|ingredients|info|for|on|of|about|in|allergens|what|is|are|the)", 
+                           "", query, flags=re.IGNORECASE)
+    fallback_term = fallback_term.strip().replace("?", "")
+    
+    if fallback_term:
+        print(f"NLP (Fallback) found: {fallback_term}")
+        return fallback_term
 
-def get_financial_context(query: str) -> str:
-    """Fetch the latest stock quote for a ticker found in the query using Alpha Vantage."""
-    api_key = os.getenv("FINANCIAL_API_KEY")
+    return None # Give up
+
+# --- Food Recalls Helper (Cached) ---
+
+@lru_cache(maxsize=128) 
+def get_food_recalls(query: str) -> str:
+    """Fetch recent food recalls from openFDA, using an API key."""
+    
+    api_key = OPENFDA_API_KEY 
     if not api_key:
-        return "Financial API key not found. Please check your .env file."
+        return "openFDA API key not found. Please check your .env file."
 
-    ticker = extract_ticker(query)
-    if not ticker:
-        return "Couldn't identify a stock ticker in the query."
+    match = re.search(r"(?:recall|recalls)\s(?:on|for|of|about)\s(.+)", query, re.IGNORECASE)
+    if match:
+        search_term = match.group(1).strip().replace("?", "")
+    else:
+        search_term = query.replace("recall", "").replace("recalls", "").strip().replace("?", "")
+        search_term = re.sub(r"^(is|are|there|any)\s+", "", search_term, flags=re.IGNORECASE).strip()
 
-    # Alpha Vantage Global Quote Endpoint
-    url = "https://www.alphavantage.co/query"
+    if not search_term or len(search_term) < 2:
+        search_query = 'status:"Ongoing"'
+        context_term = "general"
+    else:
+        search_query = f'(product_description:"{search_term}" OR reason_for_recall:"{search_term}") AND status:"Ongoing"'
+        context_term = f"'{search_term}'"
+
+    print(f"Searching for recalls related to: {context_term}")
+    
+    url = "https://api.fda.gov/food/enforcement.json"
     params = {
-        "function": "GLOBAL_QUOTE",
-        "symbol": ticker,
-        "apikey": api_key
+        "api_key": api_key,
+        "search": search_query,
+        "limit": 3
     }
 
     try:
         res = requests.get(url, params=params, timeout=10)
-        res.raise_for_status() # Raise exception for bad status codes (4xx or 5xx)
+        
+        if res.status_code == 404:
+            print("openFDA API returned 404 (No matches found)")
+            return f"No recent food recalls found matching {context_term}."
+
+        if res.status_code != 200:
+            return f"Couldn't fetch recall data. (status: {res.status_code}, response: {res.text})"
+
         data = res.json()
+        results = data.get("results", [])
+        
+        if not results:
+            return f"No recent food recalls found matching {context_term}."
 
-        quote = data.get("Global Quote")
-        if not quote or len(quote) < 5:
-             # This means the ticker was likely not found or the market is closed and data is unavailable
-            return f"No financial data available for ticker '{ticker}'. It may not exist."
+        summaries = []
+        for item in results:
+            product = item.get("product_description", "Unknown product")
+            reason = item.get("reason_for_recall", "No reason provided")
+            company = item.get("recalling_firm", "Unknown company")
+            summaries.append(
+                f"**Product:** {product} | **Reason:** {reason} | **Company:** {company}"
+            )
+        
+        return "Recent Food Recalls: \n- " + "\n- ".join(summaries)
+            
+    except Exception as e:
+        print("openFDA fetch error:", e)
+        return f"Error fetching food recalls: {str(e)}"
 
-        # Extract and format key financial metrics
-        current_price = quote.get("05. price", "N/A")
-        change_percent = quote.get("10. change percent", "N/A")
-        volume = int(quote.get("06. volume", 0))
 
-        # Format volume with commas for readability
-        formatted_volume = f"{volume:,}"
+# --- Product Info Helper 1 (Fallback) (Cached) ---
+
+@lru_cache(maxsize=128) 
+def get_openfoodfacts_info(search_term: str) -> Optional[str]:
+    """
+    Fetch product info from Open Food Facts.
+    Returns a formatted string on success, None on failure.
+    """
+    print(f"CALLING: Open Food Facts API for '{search_term}'") 
+    url = "https://world.openfoodfacts.org/cgi/search.pl"
+    params = {
+        "search_terms": search_term,
+        "search_simple": 1,
+        "action": "process",
+        "json": 1,
+        "page_size": 1 
+    }
+
+    try:
+        res = requests.get(url, params=params, timeout=10) 
+        
+        if res.status_code != 200:
+            print(f"Open Food Facts API error: Status {res.status_code}")
+            return None 
+
+        data = res.json()
+        products = data.get("products", [])
+        
+        if not products:
+            print("Open Food Facts: No products found.")
+            return None 
+
+        product = products[0]
+        name = product.get("product_name", "N/A")
+        brands = product.get("brands", "N/A")
+        ingredients = product.get("ingredients_text", "No ingredients listed.")
+        allergens = product.get("allergens_from_ingredients", "No allergens listed.")
+        nutriscore = product.get("nutrition_grade_fr", "N/A").upper()
 
         return (
-            f"Current financial data for **{ticker}**: "
-            f"Price: ${current_price}. "
-            f"Change: {change_percent} since last close. "
-            f"Volume today: {formatted_volume}."
+            f"[From Open Food Facts (Fallback)]\n" 
+            f"**Product:** {name} (by {brands}) | **Nutri-Score:** {nutriscore}\n"
+            f"**Ingredients:** {ingredients}\n"
+            f"**Allergens:** {allergens}"
+        )
+            
+    except requests.exceptions.RequestException as e:
+        print(f"Open Food Facts fetch error: {e}")
+        return None 
+    except Exception as e:
+        print(f"Open Food Facts generic error: {e}")
+        return None
+
+
+# --- Product Info Helper 2 (Primary) (Cached) ---
+
+@lru_cache(maxsize=128) 
+def get_usda_nutrition(search_term: str) -> Optional[str]:
+    """
+    Fetch product info from USDA FoodData Central.
+    Returns a formatted string on success, None on failure.
+    """
+    print(f"CALLING: USDA API for '{search_term}'") 
+    api_key = USDA_API_KEY
+    if not api_key:
+        print("USDA API key not found.")
+        return None
+
+    try:
+        search_url = "https://api.nal.usda.gov/fdc/v1/foods/search"
+        search_params = {
+            "api_key": api_key,
+            "query": search_term,
+            "dataType": ["Branded", "Foundation"], 
+            "pageSize": 1
+        }
+        
+        res_search = requests.get(search_url, params=search_params, timeout=10)
+        
+        if res_search.status_code != 200:
+            print(f"USDA Search API error: Status {res_search.status_code}")
+            return None
+
+        search_data = res_search.json()
+        foods = search_data.get("foods", [])
+        
+        if not foods:
+            print("USDA: No products found.")
+            return None
+
+        fdcId = foods[0].get("fdcId")
+        if not fdcId:
+            return None
+            
+        details_url = f"https://api.nal.usda.gov/fdc/v1/food/{fdcId}"
+        details_params = {"api_key": api_key}
+        
+        res_details = requests.get(details_url, params=details_params, timeout=10)
+        
+        if res_details.status_code != 200:
+            print(f"USDA Details API error: Status {res_details.status_code}")
+            return None
+            
+        data = res_details.json()
+        
+        name = data.get("description", "N/A")
+        brand = data.get("brandOwner", "N/A")
+        ingredients = data.get("ingredients", "No ingredients listed.")
+        
+        nutrients = {n.get("nutrient", {}).get("name"): f"{n.get('amount', 0)} {n.get('nutrient', {}).get('unitName', '')}" 
+                     for n in data.get("foodNutrients", [])}
+        
+        protein = nutrients.get("Protein", "N/A")
+        fat = nutrients.get("Total lipid (fat)", "N/A")
+        carbs = nutrients.get("Carbohydrate, by difference", "N/A")
+        sugars = nutrients.get("Total Sugars", "N/A")
+
+        return (
+            f"[From USDA FoodData Central (Primary)]\n" 
+            f"**Product:** {name} (by {brand})\n"
+            f"**Key Nutrients (per 100g):**\n"
+            f"  - Protein: {protein}\n"
+            f"  - Fat: {fat}\n"
+            f"  - Carbs: {carbs}\n"
+            f"  - Sugars: {sugars}\n"
+            f"**Ingredients:** {ingredients}"
         )
 
     except requests.exceptions.RequestException as e:
-        print("Financial fetch error:", e)
-        return f"Error connecting to financial data API: {str(e)}"
-
-# ... (Remaining FastAPI setup, home, and handle_query functions)
-# Note: You still need to place your API key for Alpha Vantage into your .env file
+        print(f"USDA fetch error: {e}")
+        return None
+    except Exception as e:
+        print(f"USDA generic error: {e}")
+        return None

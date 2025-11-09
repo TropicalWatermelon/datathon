@@ -1,12 +1,23 @@
+# ui.py
+
 import streamlit as st
 import requests
 
-st.set_page_config(page_title="Simple MCP Demo", page_icon="^_^", layout="centered")
+st.set_page_config(page_title="Food MCP Demo", page_icon="🍎", layout="centered")
 
-st.title("Model Context Protocol Demo")
-st.write("Ask me about **weather** or **news**, and I’ll fetch live context before answering!")
+st.title("Food Safety & Nutrition Demo")
 
-query = st.text_input("YourW question", placeholder="e.g., What’s the weather in Austin?")
+# --- UPDATED: New description ---
+st.write(
+    "Ask me about **food recalls** or **product nutrition & ingredients**!"
+)
+
+# --- UPDATED: New placeholder ---
+query = st.text_input(
+    "Your question", 
+    placeholder="e.g., Are there any recalls on lettuce?"
+)
+
 submit = st.button("Ask")
 
 if submit and query.strip():
