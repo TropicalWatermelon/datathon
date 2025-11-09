@@ -30,11 +30,13 @@ if submit and query.strip():
             )
             if response.status_code == 200:
                 data = response.json()
-                st.subheader("Context")
-                st.info(data.get("context", "No context found."))
 
                 st.subheader("AI Response")
                 st.success(data.get("response", "No response generated."))
+                
+                st.subheader("Context")
+                st.info(data.get("context", "No context found."))
+
             else:
                 st.error(f"Server returned {response.status_code}: {response.text}")
         except requests.exceptions.ConnectionError:
