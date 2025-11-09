@@ -41,5 +41,11 @@ This should launch the MCP server on your primary browser, this is hosted using 
 More explanation ----------------------------------------
 
 So our devloplment process revolved heavily around what free API's were available, and we knew that the USDA, and FDA had really good nutrition and food safety databases we could use. We also chose to use a hardcoded approach to workout recommendations, as there are only a small set of workouts and the free excercise API's were difficult to work with. We also tried using the model itself, but without a good API it has a hard time grasping context, making it give random gibberish.
- 
+
+ In order to use the server correctly, you will ned to generate three API's in a new .env file you create in your own environemnt. This file sould be formatted as the following -
+  GEMINI_API_KEY=XXXXXXXXXXXXXXXXXXXXX
+  USDA_API_KEY=XXXXXXXXXXXXXXXXXXXXX
+ OPENFDA_API_KEY=XXXXXXXXXXXXXXXXXXXXX
+
+ Where the X's represent your KEY, and you have one for Gemini, one from the USDA, and one from OPENFDA!
 
