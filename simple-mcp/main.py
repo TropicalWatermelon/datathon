@@ -8,12 +8,15 @@ import re
 from typing import Optional
 from functools import lru_cache
 
+from utils.workout_recommender import get_router as get_workout_router
+
 # Use the shared multi-item parser (which already loads spaCy internally)
 from utils.multi_parser import extract_product_search_terms_multi, get_multi_context
 
 load_dotenv()
 
 app = FastAPI()
+app.include_router(get_workout_router())
 
 # --- Environment variables ---
 OPENFDA_API_KEY = os.getenv("OPENFDA_API_KEY")
