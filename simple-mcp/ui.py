@@ -5,7 +5,7 @@ import requests
 
 st.set_page_config(page_title="Food MCP Demo", page_icon="🍎", layout="centered")
 
-st.title("Food-Safety & Workout Demo")
+st.title("FOOD-WORK's DEMO")
 
 st.write(
     "Ask about **recalls**, **nutrition**, or **workout ideas** based on food!"
