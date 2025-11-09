@@ -13,8 +13,6 @@ nlp = spacy.load("en_core_web_sm")
 OPENFDA_API_KEY = os.getenv("OPENFDA_API_KEY")
 USDA_API_KEY = os.getenv("USDA_API_KEY")
 
-# ---------- Helpers copied from your main ----------
-
 @lru_cache(maxsize=128)
 def get_openfoodfacts_info(search_term: str) -> Optional[str]:
     url = "https://world.openfoodfacts.org/cgi/search.pl"
@@ -54,6 +52,21 @@ def get_openfoodfacts_info(search_term: str) -> Optional[str]:
 
 @lru_cache(maxsize=128)
 def get_usda_nutrition(search_term: str) -> Optional[str]:
+    
+    # Hard-code a response for "water" to avoid bad matches
+    if search_term.lower() in ["water", "a glass of water", "glass of water"]:
+        print("Returning default context for 'water'")
+        return (
+            f"[USDA]\n"
+            f"**Product:** Water (by N/A)\n"
+            f"**Key Nutrients (per 100g):**\n"
+            f"   - Protein: 0.0 g\n"
+            f"   - Fat: 0.0 g\n"
+            f"   - Carbs: 0.0 g\n"
+            f"   - Sugars: 0.0 g\n"
+            f"**Ingredients:** Water"
+        )
+    
     api_key = USDA_API_KEY
     if not api_key:
         return None
@@ -107,10 +120,10 @@ def get_usda_nutrition(search_term: str) -> Optional[str]:
             f"[USDA]\n"
             f"**Product:** {name} (by {brand})\n"
             f"**Key Nutrients (per 100g):**\n"
-            f"  - Protein: {protein}\n"
-            f"  - Fat: {fat}\n"
-            f"  - Carbs: {carbs}\n"
-            f"  - Sugars: {sugars}\n"
+            f"   - Protein: {protein}\n"
+            f"   - Fat: {fat}\n"
+            f"   - Carbs: {carbs}\n"
+            f"   - Sugars: {sugars}\n"
             f"**Ingredients:** {ingredients}"
         )
 
@@ -164,10 +177,18 @@ def get_food_recalls_for_term(term: str, limit: int = 3) -> str:
 
 _STOPWORDS = {
     "nutrition", "nutritional", "ingredients", "ingredient",
-    "info", "information", "allergens",
-    "for", "on", "of", "about", "in",
-    "what", "is", "are", "the", "a", "an",
-    "recall", "recalls"
+    "info", "information", "allergens", "recall", "recalls",
+    
+    "workout", "exercise", "train", "gym", "work", "out",
+    "excercise", 
+    
+    "for", "on", "of", "about", "in", "what", "is", "are", "the",
+    "a", "an", "i", "ate", "eat", "eating", "should", "how", "me", "my",
+    "give", "tell", "show", "can", "after", "please", "and",
+    
+    # --- Polishing Fix ---
+    "drank", "drink", "had", "plan" 
+    # --- End of Fix ---
 }
 
 _LIST_SEP = re.compile(r",| and | & ", flags=re.IGNORECASE)
@@ -179,22 +200,45 @@ def _clean_phrase(s: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+def _is_stop_phrase(phrase: str) -> bool:
+    words = phrase.lower().split()
+    if not words:
+        return True
+    return all(word in _STOPWORDS for word in words)
 
 def extract_product_search_terms_multi(query: str, max_terms: int = 6) -> List[str]:
     q = query.strip()
     parts = [p for p in _LIST_SEP.split(q) if p.strip()]
+    if not parts or len(parts) == 1:
+        parts = [q]
 
     candidates = []
     for p in parts:
         cleaned = _clean_phrase(p)
-        if cleaned and cleaned not in _STOPWORDS:
-            candidates.append(cleaned)
+        if cleaned and not _is_stop_phrase(cleaned):
+            
+            # --- Polishing Fix: Clean stopwords from the *beginning* ---
+            words = cleaned.split()
+            while words and words[0] in _STOPWORDS:
+                words.pop(0)
+            
+            final_phrase = " ".join(words).strip()
+            if final_phrase and final_phrase not in candidates:
+                candidates.append(final_phrase)
+            # --- End of Fix ---
+            
+    if candidates and len(candidates) > 1:
+         return candidates[:max_terms]
 
     doc = nlp(q.lower())
     for chunk in doc.noun_chunks:
+        if _is_stop_phrase(chunk.text):
+            continue
+        
         phrase = " ".join([t.text for t in chunk if t.text not in _STOPWORDS]).strip()
         if phrase and phrase not in candidates:
-            candidates.append(phrase)
+            if not any(phrase in c for c in candidates):
+                candidates.append(phrase)
 
     tokens = [t.text for t in doc if t.pos_ in {"NOUN", "PROPN"} and t.text not in _STOPWORDS]
     if not candidates and tokens:
@@ -215,10 +259,6 @@ def get_multi_context(
     do_recall=False,
     do_nutrition=True
 ) -> Dict[str, str]:
-    """
-    Returns per-item context blocks.
-    You can merge these into final context for the AI.
-    """
     out = {}
 
     for term in items:

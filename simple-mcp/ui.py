@@ -31,17 +31,17 @@ if submit and query.strip():
                 data = response.json()
                 response_type = data.get("type", "ai") # Default to "ai"
                 
-                # --- NEW: Handle different response types ---
                 if response_type == "plan":
-                    st.subheader("Your Workout Plan")
-                    # Use st.markdown to render the formatted plan
-                    st.markdown(data.get("response", "No plan generated."))
+                    # 1. More "human" title
+                    st.subheader("Suggested Workout")
+                    # 2. Use st.success() for the green box
+                    st.success(data.get("response", "No plan generated."))
                 else:
                     st.subheader("AI Response")
-                    # Use st.success for standard AI answers
-                    st.success(data.get("response", "No response generated."))
+                    # Use st.info for standard AI answers (blue box)
+                    st.info(data.get("response", "No response generated."))
                 
-                # --- Context is always shown ---
+                # --- Context is always shown in a blue box ---
                 st.subheader("Context")
                 st.info(data.get("context", "No context found."))
 

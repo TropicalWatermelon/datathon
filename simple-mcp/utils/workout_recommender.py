@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, List
 
 try:
-    # Optional: only used if you want to expose a REST endpoint.
     from fastapi import APIRouter, Body
     _FASTAPI_AVAILABLE = True
 except Exception:
@@ -22,12 +21,11 @@ class Macros:
     carbs_g: Optional[float] = None
     sugars_g: Optional[float] = None
     fat_g: Optional[float] = None
-    kcal: Optional[float] = None   # If present; otherwise we estimate from macros
+    kcal: Optional[float] = None 
 
     def estimated_kcal(self) -> Optional[float]:
         if self.kcal is not None:
             return self.kcal
-        # 4/4/9 rule; only sum what we have
         kcal = 0.0
         have_any = False
         if self.protein_g is not None:
@@ -39,7 +37,10 @@ class Macros:
         if self.fat_g is not None:
             kcal += 9.0 * self.fat_g
             have_any = True
-        return kcal if have_any else None
+        # Return None if no macros were found, 0.0 otherwise
+        if not have_any:
+            return None
+        return kcal
 
 
 _MACRO_KEYS = {
@@ -52,9 +53,6 @@ _MACRO_KEYS = {
 
 
 def _extract_number(unit_str: str) -> Optional[float]:
-    """
-    Pull the first float-like number (e.g., '12 g', '12.5g', '12 mg') out of a snippet.
-    """
     if not unit_str:
         return None
     m = re.search(r"(-?\d+(?:\.\d+)?)", unit_str)
@@ -62,10 +60,6 @@ def _extract_number(unit_str: str) -> Optional[float]:
 
 
 def _find_line_for_key(text: str, keys: List[str]) -> Optional[str]:
-    """
-    Within text, find the first line that contains any of the keys (case-insensitive).
-    Returns the whole line so we can parse numbers/units from it.
-    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     for ln in lines:
         low = ln.lower()
@@ -76,31 +70,19 @@ def _find_line_for_key(text: str, keys: List[str]) -> Optional[str]:
 
 
 def parse_macros_from_context(context: str) -> Macros:
-    """
-    Parse a USDA/OpenFoodFacts-style block, like:
-      **Key Nutrients (per 100g):**
-        - Protein: 12 g
-        - Fat: 5 g
-        - Carbs: 30 g
-        - Sugars: 20 g
-    Also tries to detect 'Energy'/'Calories' if present.
-    """
     ctx_low = context.lower()
 
     def grab(keys: List[str]) -> Optional[float]:
         line = _find_line_for_key(context, keys)
         if not line:
-            # also try "Name: value" pattern across the entire text
             for k in keys:
                 m = re.search(rf"{re.escape(k)}\s*[:\-]\s*([^\n\r]+)", ctx_low, flags=re.IGNORECASE)
                 if m:
                     return _extract_number(m.group(1))
             return None
-        # Try "Something: number unit" on that line
         m = re.search(r"[:\-]\s*([^\n\r]+)", line)
         if m:
             return _extract_number(m.group(1))
-        # Fallback: grab any number on the line
         return _extract_number(line)
 
     macros = Macros(
@@ -119,25 +101,23 @@ def parse_macros_from_context(context: str) -> Macros:
 
 @dataclass
 class WorkoutPlan:
-    title: str
+    # --- Polishing Fix: Separated title data ---
+    # title: str  (Removed)
     minutes: int
-    intensity: str  # "low" | "moderate" | "high"
-    focus: str      # "strength" | "hypertrophy" | "conditioning" | "mixed" | "active recovery"
+    intensity: str
+    focus: str
     blocks: List[str]
     warmup: List[str]
     cooldown: List[str]
     rationale: str
     nutrition_tip: str
+    product_hint: Optional[str] = None # (Added)
+    kcal_est: Optional[float] = None   # (Added)
+    experience: str = "beginner"       # (Added)
+    # --- End of Fix ---
 
 
 def _choose_focus(macros: Macros, goal: str) -> Tuple[str, str]:
-    """
-    Decide the workout focus + short rationale based on macros and the stated goal.
-    Heuristics:
-      - Higher carbs/sugars -> better for conditioning or mixed intervals today
-      - Higher protein & moderate fat -> strength/hypertrophy window
-      - Very high fat/low carbs -> keep intensity submax or short intervals
-    """
     g = (goal or "balance").lower()
     protein = macros.protein_g or 0.0
     carbs = macros.carbs_g or 0.0
@@ -145,11 +125,12 @@ def _choose_focus(macros: Macros, goal: str) -> Tuple[str, str]:
     fat = macros.fat_g or 0.0
     kcal = macros.estimated_kcal() or 0.0
 
-    sugar_ratio = (sugars / carbs) if carbs > 1e-6 else 0.0
-    carb_bias = carbs >= 25  # per 100g context often
+    # Raised thresholds
+    sugar_ratio = (sugars / carbs) if carbs > 1.0 else 0.0
+    carb_bias = carbs >= 30  
     protein_bias = protein >= 15
     fat_bias = fat >= 15
-    high_sugar = sugars >= 12 or sugar_ratio >= 0.35
+    high_sugar = sugars >= 15 and sugar_ratio >= 0.4 
 
     # Goal overrides
     if g in ["strength", "power"]:
@@ -159,7 +140,7 @@ def _choose_focus(macros: Macros, goal: str) -> Tuple[str, str]:
     if g in ["muscle", "hypertrophy", "build"]:
         return ("hypertrophy", "Goal is muscle gain—moderate loads, higher volume.")
 
-    # Heuristics from macros if goal is 'balance' or unspecified
+    # Heuristics
     if carb_bias and not fat_bias:
         return ("conditioning",
                 "Higher carbohydrate intake supports glycogen-fueled intervals and aerobic work today.")
@@ -172,6 +153,12 @@ def _choose_focus(macros: Macros, goal: str) -> Tuple[str, str]:
     if high_sugar:
         return ("conditioning",
                 "Higher sugar spikes are well-utilized by short-to-mid interval conditioning.")
+    
+    # Fallback for low-energy foods
+    if carbs < 15 and protein < 10 and fat < 10:
+        return ("active recovery",
+                "This is a very low-energy food/drink. A light active recovery session (like a walk or stretching) is a great choice.")
+    
     return ("mixed", "Balanced macros—today suits a mixed session (strength + conditioning).")
 
 
@@ -179,7 +166,6 @@ def _default_blocks_for_focus(focus: str, minutes: int, experience: str) -> Tupl
     exp = (experience or "beginner").lower()
     m = max(15, min(75, int(minutes or 30)))
 
-    # Allocate time chunks
     if focus == "strength":
         main = max(10, int(m * 0.6))
         aux = max(5, int(m * 0.25))
@@ -217,7 +203,19 @@ def _default_blocks_for_focus(focus: str, minutes: int, experience: str) -> Tupl
         if core >= 5:
             blocks.append(f"Core/Carry ({core} min): plank holds + farmer carries.")
         rationale = "Intervals + tempo train aerobic base and lactate clearance; great use of higher carbs/sugars."
-    else:  # "mixed" or "active recovery"
+        
+    elif focus == "active recovery":
+        blocks = [
+            f"Light Cardio ({int(m*0.4)} min): Easy walk, bike, or elliptical. Should be able to hold a conversation.",
+            f"""Mobility ({int(m*0.6)} min): Focus on 3-4 key areas. Examples:
+  - 10-15 Cat/Cows
+  - 2 min Couch Stretch (each side)
+  - 2 min Pigeon Pose (each side)
+  - 10-15 T-Spine Rotations"""
+        ]
+        rationale = "This is a low-energy day, so we'll focus on light movement and mobility to aid recovery and feel good."
+        
+    else:  # "mixed"
         strength = max(8, int(m * 0.35))
         metcon = max(6, int(m * 0.35))
         mobility = m - strength - metcon
@@ -229,7 +227,6 @@ def _default_blocks_for_focus(focus: str, minutes: int, experience: str) -> Tupl
             blocks.append(f"Mobility ({mobility} min): hips, T-spine, calves (slow controlled).")
         rationale = "Mixed session balances force production with metabolic conditioning without overreaching."
 
-    # Warm-up / Cool-down change with experience
     if exp in ["beginner", "novice"]:
         warmup = [
             "5 min easy cardio",
@@ -243,7 +240,7 @@ def _default_blocks_for_focus(focus: str, minutes: int, experience: str) -> Tupl
         ]
         cooldown = ["Breathing down-shift (2–3 min)", "Light mobility in tight areas"]
 
-    intensity = {"strength": "moderate", "hypertrophy": "moderate", "conditioning": "high", "mixed": "moderate"}.get(focus, "low")
+    intensity = {"strength": "moderate", "hypertrophy": "moderate", "conditioning": "high", "mixed": "moderate", "active recovery": "low"}.get(focus, "low")
     return blocks, rationale, intensity
 
 
@@ -259,9 +256,13 @@ def _nutrition_tip(macros: Macros, focus: str) -> str:
             tip += " (Protein looked low—consider a serving of yogurt/shake/chicken.)"
     elif focus == "conditioning":
         tip = "Sip water; if intervals exceed 25–30 min, add electrolytes. Post-workout carbs (30–60 g) help."
-        if sugars >= 12 and carbs >= 25:
+        if sugars >= 15 and carbs >= 30: 
             tip += " (High sugars today—put them to work with those intervals!)"
-    else:
+    
+    elif focus == "active recovery":
+        tip = "Great job on the light movement. Focus on hydration and a standard, balanced meal."
+    
+    else: # Mixed
         tip = "Balance plate post-session: lean protein, veggies, and a fist of carbs. Hydrate well."
     return tip
 
@@ -273,23 +274,14 @@ def recommend_workout_from_context(
     experience: str = "beginner",
     product_hint: Optional[str] = None,
 ) -> WorkoutPlan:
-    """
-    Main entry point. Feed it the nutrition 'context' string you already build.
-    Returns a structured WorkoutPlan.
-    """
     macros = parse_macros_from_context(context)
     focus, why = _choose_focus(macros, goal)
     blocks, rationale_core, intensity = _default_blocks_for_focus(focus, minutes, experience)
-    title_bits = [focus.capitalize(), f"{int(minutes)}-min"]
-    if product_hint:
-        title_bits.append(f"• fueled by {product_hint}")
+    
+    # --- Polishing Fix: Pass raw data to dataclass ---
     kcal_est = macros.estimated_kcal()
-    if kcal_est:
-        title_bits.append(f"• ~{int(round(kcal_est))} kcal/100g")
-    title = " | ".join(title_bits)
 
     plan = WorkoutPlan(
-        title=title,
         minutes=max(15, min(75, int(minutes or 30))),
         intensity=intensity,
         focus=focus,
@@ -304,7 +296,11 @@ def recommend_workout_from_context(
         ],
         rationale=f"{why} {rationale_core}",
         nutrition_tip=_nutrition_tip(macros, focus),
+        product_hint=product_hint, # (Added)
+        kcal_est=kcal_est,         # (Added)
+        experience=experience      # (Added)
     )
+    # --- End of Fix ---
     return plan
 
 
@@ -313,11 +309,6 @@ def recommend_workout_from_context(
 # ---------------------------
 
 def get_router() -> "APIRouter":
-    """
-    Returns a FastAPI APIRouter that exposes:
-      POST /workout  with body { query, context, goal, minutes, experience, product_hint }
-    'query' is unused except for echo/debug; 'context' is your nutrition text.
-    """
     if not _FASTAPI_AVAILABLE:
         raise RuntimeError("FastAPI not available; install fastapi to use the router.")
 
@@ -339,10 +330,10 @@ def get_router() -> "APIRouter":
             experience=experience,
             product_hint=product_hint,
         )
+        # --- Polishing Fix: Return new dataclass structure ---
         return {
             "query": query,
             "plan": {
-                "title": plan.title,
                 "minutes": plan.minutes,
                 "intensity": plan.intensity,
                 "focus": plan.focus,
@@ -351,7 +342,11 @@ def get_router() -> "APIRouter":
                 "cooldown": plan.cooldown,
                 "rationale": plan.rationale,
                 "nutrition_tip": plan.nutrition_tip,
+                "product_hint": plan.product_hint, 
+                "kcal_est": plan.kcal_est,         
+                "experience": plan.experience,     
             }
         }
+        # --- End of Fix ---
 
     return router
